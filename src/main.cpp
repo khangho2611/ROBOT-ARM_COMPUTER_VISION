@@ -14,24 +14,25 @@ const byte PIN_D6_GRIPPER = 6;
 // =========================
 // Manual calibration angles
 // =========================
-// Remembered default servo angles:
+// Remembered safe defaults:
 // D11 Base = 82, D10 Lift = 0, D9 Extend = 0, D6 Gripper/Open = 135.
+// Fill PICK/DROP/GRIP_CLOSE with real calibrated angles before full picking.
 
 const int HOME_D11 = 82;
 const int HOME_D10 = 0;
 const int HOME_D9 = 0;
 const int GRIP_OPEN = 135;
-const int GRIP_CLOSE = 90;    // TODO: fill calibrated angle
+const int GRIP_CLOSE = 90;    // TODO: fill calibrated close angle
 
-const int PICK_UP_D10 = 90;   // TODO: fill calibrated angle
-const int PICK_UP_D9 = 90;    // TODO: fill calibrated angle
+const int PICK_UP_D10 = 0;    // TODO: fill calibrated angle
+const int PICK_UP_D9 = 0;     // TODO: fill calibrated angle
 
-const int PICK_DOWN_D10 = 90; // TODO: fill calibrated angle
-const int PICK_DOWN_D9 = 90;  // TODO: fill calibrated angle
+const int PICK_DOWN_D10 = 0;  // TODO: fill calibrated angle
+const int PICK_DOWN_D9 = 0;   // TODO: fill calibrated angle
 
 const int DROP_D11 = 82;      // TODO: fill calibrated angle
-const int DROP_D10 = 90;      // TODO: fill calibrated angle
-const int DROP_D9 = 90;       // TODO: fill calibrated angle
+const int DROP_D10 = 0;       // TODO: fill calibrated angle
+const int DROP_D9 = 0;        // TODO: fill calibrated angle
 
 // =========================
 // Motion tuning
@@ -55,7 +56,7 @@ int liftCurrentAngle = HOME_D10;
 int extendCurrentAngle = HOME_D9;
 int gripperCurrentAngle = GRIP_OPEN;
 
-char commandBuffer[56];
+char commandBuffer[64];
 byte commandLength = 0;
 
 int limitAngle(int angle) {
@@ -114,7 +115,7 @@ bool ensureServosEnabled() {
   return false;
 }
 
-void attachIfNeeded() {
+void attachServosIfNeeded() {
   if (!baseServo.attached()) {
     baseServo.attach(PIN_D11_BASE);
   }
@@ -135,7 +136,7 @@ void enableServosAtAngles(int d11, int d10, int d9, int d6) {
   extendCurrentAngle = limitAngle(d9);
   gripperCurrentAngle = limitAngle(d6);
 
-  attachIfNeeded();
+  attachServosIfNeeded();
 
   writeServoSafe(baseServo, baseCurrentAngle);
   writeServoSafe(liftServo, liftCurrentAngle);
@@ -205,9 +206,7 @@ void moveTwoServoSmooth(
   int startB = currentB;
   int deltaA = targetA - startA;
   int deltaB = targetB - startB;
-  int stepsA = abs(deltaA);
-  int stepsB = abs(deltaB);
-  int steps = max(stepsA, stepsB);
+  int steps = max(abs(deltaA), abs(deltaB));
 
   if (steps == 0) {
     return;
@@ -234,6 +233,64 @@ void moveTwoServoSmooth(
   currentB = targetB;
   writeServoSafe(servoA, currentA);
   writeServoSafe(servoB, currentB);
+}
+
+void moveHome() {
+  if (!ensureServosEnabled()) {
+    return;
+  }
+
+  moveTwoServoSmooth(liftServo, liftCurrentAngle, HOME_D10, extendServo, extendCurrentAngle, HOME_D9);
+  waitSmall(POSE_SETTLE_MS);
+  moveServoSmooth(baseServo, baseCurrentAngle, HOME_D11);
+  waitSmall(POSE_SETTLE_MS);
+  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_OPEN);
+  waitSmall(GRIP_SETTLE_MS);
+
+  Serial.println(F("HOME DONE"));
+}
+
+void runPickSequence(int baseAngle) {
+  Serial.println(F("RECEIVED PICK"));
+
+  if (!ensureServosEnabled()) {
+    return;
+  }
+
+  baseAngle = limitAngle(baseAngle);
+
+  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_OPEN);
+  waitSmall(GRIP_SETTLE_MS);
+
+  Serial.println(F("MOVING BASE"));
+  moveServoSmooth(baseServo, baseCurrentAngle, baseAngle);
+  waitSmall(POSE_SETTLE_MS);
+
+  Serial.println(F("PICK UP"));
+  moveTwoServoSmooth(liftServo, liftCurrentAngle, PICK_UP_D10, extendServo, extendCurrentAngle, PICK_UP_D9);
+  waitSmall(POSE_SETTLE_MS);
+
+  Serial.println(F("PICK DOWN"));
+  moveTwoServoSmooth(liftServo, liftCurrentAngle, PICK_DOWN_D10, extendServo, extendCurrentAngle, PICK_DOWN_D9);
+  waitSmall(POSE_SETTLE_MS);
+
+  Serial.println(F("GRIP CLOSE"));
+  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_CLOSE);
+  waitSmall(GRIP_SETTLE_MS);
+
+  Serial.println(F("LIFT"));
+  moveTwoServoSmooth(liftServo, liftCurrentAngle, PICK_UP_D10, extendServo, extendCurrentAngle, PICK_UP_D9);
+  waitSmall(POSE_SETTLE_MS);
+
+  Serial.println(F("DROP"));
+  moveServoSmooth(baseServo, baseCurrentAngle, DROP_D11);
+  waitSmall(POSE_SETTLE_MS);
+  moveTwoServoSmooth(liftServo, liftCurrentAngle, DROP_D10, extendServo, extendCurrentAngle, DROP_D9);
+  waitSmall(POSE_SETTLE_MS);
+  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_OPEN);
+  waitSmall(GRIP_SETTLE_MS);
+
+  moveHome();
 }
 
 void setSingleServo(const char *servoId, int angle) {
@@ -270,71 +327,16 @@ void setAllServos(int d11, int d10, int d9, int d6) {
   moveServoSmooth(baseServo, baseCurrentAngle, d11);
   moveTwoServoSmooth(liftServo, liftCurrentAngle, d10, extendServo, extendCurrentAngle, d9);
   moveServoSmooth(gripperServo, gripperCurrentAngle, d6);
-
   Serial.println(F("OK SETALL"));
-}
-
-void moveHome() {
-  if (!ensureServosEnabled()) {
-    return;
-  }
-
-  moveTwoServoSmooth(liftServo, liftCurrentAngle, HOME_D10, extendServo, extendCurrentAngle, HOME_D9);
-  waitSmall(POSE_SETTLE_MS);
-  moveServoSmooth(baseServo, baseCurrentAngle, HOME_D11);
-  waitSmall(POSE_SETTLE_MS);
-  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_OPEN);
-  waitSmall(GRIP_SETTLE_MS);
-
-  Serial.println(F("HOME DONE"));
-}
-
-void runPickSequence(int baseAngle) {
-  if (!ensureServosEnabled()) {
-    return;
-  }
-
-  baseAngle = limitAngle(baseAngle);
-
-  Serial.println(F("RECEIVED PICK"));
-
-  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_OPEN);
-  waitSmall(GRIP_SETTLE_MS);
-
-  Serial.println(F("MOVING BASE"));
-  moveServoSmooth(baseServo, baseCurrentAngle, baseAngle);
-  waitSmall(POSE_SETTLE_MS);
-
-  Serial.println(F("PICK UP"));
-  moveTwoServoSmooth(liftServo, liftCurrentAngle, PICK_UP_D10, extendServo, extendCurrentAngle, PICK_UP_D9);
-  waitSmall(POSE_SETTLE_MS);
-
-  Serial.println(F("PICK DOWN"));
-  moveTwoServoSmooth(liftServo, liftCurrentAngle, PICK_DOWN_D10, extendServo, extendCurrentAngle, PICK_DOWN_D9);
-  waitSmall(POSE_SETTLE_MS);
-
-  Serial.println(F("GRIP CLOSE"));
-  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_CLOSE);
-  waitSmall(GRIP_SETTLE_MS);
-
-  Serial.println(F("LIFT"));
-  moveTwoServoSmooth(liftServo, liftCurrentAngle, PICK_UP_D10, extendServo, extendCurrentAngle, PICK_UP_D9);
-  waitSmall(POSE_SETTLE_MS);
-
-  Serial.println(F("DROP"));
-  moveServoSmooth(baseServo, baseCurrentAngle, DROP_D11);
-  waitSmall(POSE_SETTLE_MS);
-  moveTwoServoSmooth(liftServo, liftCurrentAngle, DROP_D10, extendServo, extendCurrentAngle, DROP_D9);
-  waitSmall(POSE_SETTLE_MS);
-  moveServoSmooth(gripperServo, gripperCurrentAngle, GRIP_OPEN);
-  waitSmall(GRIP_SETTLE_MS);
-
-  moveHome();
 }
 
 void printStatus() {
   Serial.print(F("STATUS "));
-  Serial.print(servosEnabled ? F("ENABLED") : F("DISABLED"));
+  if (servosEnabled) {
+    Serial.print(F("ENABLED"));
+  } else {
+    Serial.print(F("DISABLED"));
+  }
   Serial.print(F(" D11="));
   Serial.print(baseCurrentAngle);
   Serial.print(F(" D10="));
@@ -364,8 +366,28 @@ void processCommand(char *command) {
     return;
   }
 
+  if (strcmp(action, "PICK") == 0) {
+    int baseAngle;
+    if (!readNextInt(baseAngle)) {
+      Serial.println(F("ERR FORMAT USE PICK,<base_angle>"));
+      return;
+    }
+    runPickSequence(baseAngle);
+    return;
+  }
+
   if (strcmp(action, "DETACH") == 0) {
     detachServos();
+    return;
+  }
+
+  if (strcmp(action, "HOME") == 0) {
+    moveHome();
+    return;
+  }
+
+  if (strcmp(action, "STATUS") == 0) {
+    printStatus();
     return;
   }
 
@@ -390,26 +412,6 @@ void processCommand(char *command) {
       return;
     }
     setAllServos(d11, d10, d9, d6);
-    return;
-  }
-
-  if (strcmp(action, "HOME") == 0) {
-    moveHome();
-    return;
-  }
-
-  if (strcmp(action, "PICK") == 0) {
-    int baseAngle;
-    if (!readNextInt(baseAngle)) {
-      Serial.println(F("ERR FORMAT USE PICK,<base_angle>"));
-      return;
-    }
-    runPickSequence(baseAngle);
-    return;
-  }
-
-  if (strcmp(action, "STATUS") == 0) {
-    printStatus();
     return;
   }
 
@@ -449,6 +451,7 @@ void setup() {
   Serial.println(F("READY ROBOT_4DOF_SAFE_WAIT"));
   Serial.println(F("SERVOS DISABLED"));
   Serial.println(F("CMD ENABLE,<D11>,<D10>,<D9>,<D6>"));
+  Serial.println(F("CMD PICK,<base_angle>"));
 }
 
 void loop() {

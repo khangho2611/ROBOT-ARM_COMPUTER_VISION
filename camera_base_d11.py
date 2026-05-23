@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 try:
     import cv2
@@ -17,11 +17,10 @@ except ImportError:
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import messagebox
 except ImportError:
     tk = None
     messagebox = None
-    ttk = None
 
 
 # =========================
@@ -44,6 +43,8 @@ V_MAX = 255
 CENTER_X = 13.5
 CENTER_Y = 8.2
 
+REFERENCE_DISTANCE_CM = 20.0
+
 BASE_CENTER = 82
 K_BASE = 4.0
 BASE_MIN = 0
@@ -55,8 +56,11 @@ BAUDRATE = 9600
 
 
 # =========================
-# Manual calibration defaults
+# Manual calibration angles
 # =========================
+# Remembered safe defaults from manual servo GUI:
+# D11 Base = 82, D10 Lift = 0, D9 Extend = 0, D6 Gripper/Open = 135.
+# Fill the remaining pick/drop angles after manual calibration.
 
 HOME_D11 = 82
 HOME_D10 = 0
@@ -64,15 +68,29 @@ HOME_D9 = 0
 GRIP_OPEN = 135
 GRIP_CLOSE = 90
 
-PICK_UP_D10 = 90
-PICK_UP_D9 = 90
+PICK_UP_D10 = 0
+PICK_UP_D9 = 0
 
-PICK_DOWN_D10 = 90
-PICK_DOWN_D9 = 90
+PICK_DOWN_D10 = 0
+PICK_DOWN_D9 = 0
 
 DROP_D11 = 82
-DROP_D10 = 90
-DROP_D9 = 90
+DROP_D10 = 0
+DROP_D9 = 0
+
+
+# =========================
+# Safety confirmations
+# =========================
+
+REQUIRE_CAMERA_STABLE_CONFIRM = True
+REQUIRE_CALIB_CONFIRM = True
+REQUIRE_PICK_CONFIRM = True
+REQUIRE_SERIAL_CONFIRM = True
+REQUIRE_ENABLE_CONFIRM = True
+
+CAMERA_STABLE_FRAMES = 35
+CAMERA_REOPEN_DELAY_SEC = 1.0
 
 
 # =========================
@@ -91,7 +109,6 @@ MIN_RECT_EXTENT = 0.35
 MIN_CONTOUR_AREA_PX = 80
 
 MORPH_KERNEL_SIZE = 5
-CAMERA_REOPEN_DELAY_SEC = 1.0
 
 
 # =========================
@@ -126,17 +143,58 @@ class Detection:
     score: float
 
 
+class ConfirmDialog:
+    def __init__(self) -> None:
+        self.root = None
+        if tk is not None and messagebox is not None:
+            self.root = tk.Tk()
+            self.root.withdraw()
+
+    def ask(self, title: str, text: str) -> bool:
+        if self.root is None or messagebox is None:
+            print()
+            print(f"{title}: {text}")
+            answer = input("Confirm? [y/N]: ").strip().lower()
+            return answer in ("y", "yes")
+
+        try:
+            self.root.update()
+            return bool(messagebox.askyesno(title, text, parent=self.root))
+        except tk.TclError:
+            return False
+
+    def close(self) -> None:
+        if self.root is not None:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
+
+
 class CalibrationState:
     def __init__(self) -> None:
         self.points: list[Tuple[int, int]] = []
         self.homography: Optional[np.ndarray] = None
+        self.confirmed = False
+        self.needs_confirmation = False
+        self.allow_clicks = False
 
     def reset(self) -> None:
         self.points.clear()
         self.homography = None
+        self.confirmed = False
+        self.needs_confirmation = False
         print("Calibration reset. Click 4 corners: top-left, top-right, bottom-right, bottom-left.")
 
     def add_point(self, x: int, y: int) -> None:
+        if not self.allow_clicks:
+            print("Camera is not confirmed yet. Wait for stable camera confirmation first.")
+            return
+
+        if self.confirmed:
+            print("Calibration already confirmed. Press r to reset if you want to calibrate again.")
+            return
+
         if len(self.points) >= 4:
             return
 
@@ -158,50 +216,53 @@ class CalibrationState:
             ]
         )
         self.homography = cv2.getPerspectiveTransform(src, dst)
-        print("Calibration done. Top View is ready.")
+        self.needs_confirmation = True
+        self.confirmed = False
+        print("Homography created. Check Top View and confirm calibration.")
+
+    def has_homography(self) -> bool:
+        return self.homography is not None
 
     def is_ready(self) -> bool:
-        return self.homography is not None
+        return self.homography is not None and self.confirmed
 
 
 class RobotSerial:
     def __init__(self) -> None:
         self.link = None
+        self.servos_enabled = False
 
     def is_connected(self) -> bool:
         return self.link is not None and self.link.is_open
 
-    def open(self, log: Callable[[str], None]) -> None:
+    def open(self) -> bool:
         if not SEND_SERIAL:
-            log("SEND_SERIAL = False. Serial commands are printed only.")
-            return
+            print("SEND_SERIAL = False. Commands will be printed only.")
+            return True
 
         if serial is None:
-            log("Missing pyserial. Install with: py -m pip install pyserial")
-            return
+            print("Missing pyserial. Install with: py -m pip install pyserial")
+            return False
 
         if self.is_connected():
-            log(f"Serial already connected: {SERIAL_PORT}")
-            return
+            return True
 
         try:
-            self.link = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.02)
+            self.link = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.05)
             time.sleep(2.0)
             self.link.reset_input_buffer()
-            log(f"Serial connected: {SERIAL_PORT} @ {BAUDRATE}")
+            print(f"Serial connected: {SERIAL_PORT} @ {BAUDRATE}")
+            return True
         except Exception as exc:
             self.link = None
-            log(f"Cannot open serial {SERIAL_PORT}: {exc}")
+            print(f"Cannot open serial {SERIAL_PORT}: {exc}")
+            return False
 
     def close(self) -> None:
         if self.link is not None and self.link.is_open:
             self.link.close()
 
-    def disconnect(self, log: Callable[[str], None]) -> None:
-        self.close()
-        log("Serial disconnected.")
-
-    def read_status(self, log: Callable[[str], None]) -> None:
+    def read_status(self) -> None:
         if not self.is_connected():
             return
 
@@ -209,267 +270,42 @@ class RobotSerial:
             while self.link.in_waiting > 0:
                 line = self.link.readline().decode("ascii", errors="replace").strip()
                 if line:
-                    log(f"Arduino: {line}")
+                    print(f"Arduino: {line}")
+                    if "SERVOS ENABLED" in line:
+                        self.servos_enabled = True
+                    elif "SERVOS DETACHED" in line:
+                        self.servos_enabled = False
         except Exception as exc:
-            log(f"Serial read error: {exc}")
+            print(f"Serial read error: {exc}")
             self.close()
+            self.servos_enabled = False
 
-    def send_command(self, command: str, log: Callable[[str], None]) -> bool:
+    def send_command(self, command: str) -> bool:
         if not SEND_SERIAL:
-            log(f"Serial off. Command not sent: {command}")
-            return False
+            print(f"Serial off. Command not sent: {command}")
+            return True
 
         if not self.is_connected():
-            log(f"Serial not connected. Command not sent: {command}")
+            print(f"Serial not connected. Command not sent: {command}")
             return False
 
         try:
             self.link.write((command + "\n").encode("ascii"))
             self.link.flush()
-            log(f"Sent: {command}")
+            print(f"Sent: {command}")
             return True
         except Exception as exc:
-            log(f"Serial write error: {exc}")
+            print(f"Serial write error: {exc}")
             self.close()
+            self.servos_enabled = False
             return False
 
-
-class ControlPanel:
-    def __init__(
-        self,
-        serial_link: RobotSerial,
-        reset_calib: Callable[[], None],
-    ) -> None:
-        if tk is None or ttk is None or messagebox is None:
-            print("Tkinter is required for the servo control GUI.")
-            raise SystemExit(1)
-
-        self.serial_link = serial_link
-        self.reset_calib = reset_calib
-        self.should_quit = False
-        self.latest_detection: Optional[Detection] = None
-        self.latest_base_angle: Optional[float] = None
-
-        self.root = tk.Tk()
-        self.root.title("Robot Arm Control")
-        self.root.protocol("WM_DELETE_WINDOW", self.request_quit)
-
-        self.serial_status = tk.StringVar(value="Serial: disconnected")
-        self.camera_status = tk.StringVar(value="Camera: waiting")
-        self.detect_status = tk.StringVar(value="Object: none")
-        self.base_status = tk.StringVar(value="Base angle: --")
-
-        self.angle_vars = {
-            "D11": tk.IntVar(value=HOME_D11),
-            "D10": tk.IntVar(value=HOME_D10),
-            "D9": tk.IntVar(value=HOME_D9),
-            "D6": tk.IntVar(value=GRIP_OPEN),
-        }
-
-        self._build()
-        self.log("Program started. Servos stay disabled until you press ENABLE SERVOS.")
-
-    def _build(self) -> None:
-        main = ttk.Frame(self.root, padding=10)
-        main.grid(row=0, column=0, sticky="nsew")
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-
-        status_frame = ttk.LabelFrame(main, text="Status", padding=8)
-        status_frame.grid(row=0, column=0, sticky="ew")
-        status_frame.columnconfigure(0, weight=1)
-        ttk.Label(status_frame, textvariable=self.camera_status).grid(row=0, column=0, sticky="w")
-        ttk.Label(status_frame, textvariable=self.serial_status).grid(row=1, column=0, sticky="w")
-        ttk.Label(status_frame, textvariable=self.detect_status).grid(row=2, column=0, sticky="w")
-        ttk.Label(status_frame, textvariable=self.base_status).grid(row=3, column=0, sticky="w")
-
-        serial_frame = ttk.LabelFrame(main, text="Serial / Safety", padding=8)
-        serial_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(serial_frame, text="Connect Serial", command=self.connect_serial).grid(row=0, column=0, padx=3, pady=3)
-        ttk.Button(serial_frame, text="Disconnect", command=self.disconnect_serial).grid(row=0, column=1, padx=3, pady=3)
-        ttk.Button(serial_frame, text="ENABLE SERVOS", command=self.enable_servos).grid(row=0, column=2, padx=3, pady=3)
-        ttk.Button(serial_frame, text="DETACH", command=self.detach_servos).grid(row=0, column=3, padx=3, pady=3)
-
-        manual_frame = ttk.LabelFrame(main, text="Manual Servo Angles", padding=8)
-        manual_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        manual_frame.columnconfigure(1, weight=1)
-
-        self._add_servo_row(manual_frame, 0, "D11", "Base")
-        self._add_servo_row(manual_frame, 1, "D10", "Lift")
-        self._add_servo_row(manual_frame, 2, "D9", "Extend")
-        self._add_servo_row(manual_frame, 3, "D6", "Gripper")
-
-        manual_buttons = ttk.Frame(manual_frame)
-        manual_buttons.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Button(manual_buttons, text="Send All", command=self.send_all).grid(row=0, column=0, padx=3)
-        ttk.Button(manual_buttons, text="D11 from Camera", command=self.fill_d11_from_camera).grid(row=0, column=1, padx=3)
-        ttk.Button(manual_buttons, text="Grip Open", command=self.grip_open).grid(row=0, column=2, padx=3)
-        ttk.Button(manual_buttons, text="Grip Close", command=self.grip_close).grid(row=0, column=3, padx=3)
-        ttk.Button(manual_buttons, text="HOME", command=self.home_robot).grid(row=0, column=4, padx=3)
-
-        pick_frame = ttk.LabelFrame(main, text="Camera Pick", padding=8)
-        pick_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(pick_frame, text="PICK Detected Object", command=self.confirm_pick).grid(row=0, column=0, padx=3, pady=3)
-        ttk.Button(pick_frame, text="Reset Calib", command=self.reset_calib).grid(row=0, column=1, padx=3, pady=3)
-        ttk.Button(pick_frame, text="Quit", command=self.request_quit).grid(row=0, column=2, padx=3, pady=3)
-
-        log_frame = ttk.LabelFrame(main, text="Log", padding=8)
-        log_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
-        main.rowconfigure(4, weight=1)
-        self.log_text = tk.Text(log_frame, height=9, width=72, state="disabled")
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        log_frame.rowconfigure(0, weight=1)
-        log_frame.columnconfigure(0, weight=1)
-
-    def _add_servo_row(self, parent: ttk.LabelFrame, row: int, servo_id: str, label: str) -> None:
-        var = self.angle_vars[servo_id]
-        ttk.Label(parent, text=f"{servo_id} {label}", width=12).grid(row=row, column=0, sticky="w", pady=3)
-        scale = tk.Scale(parent, from_=0, to=180, orient="horizontal", resolution=1, variable=var, length=330)
-        scale.grid(row=row, column=1, sticky="ew", padx=5, pady=3)
-        spin = ttk.Spinbox(parent, from_=0, to=180, textvariable=var, width=5)
-        spin.grid(row=row, column=2, padx=5, pady=3)
-        ttk.Button(parent, text="Send", command=lambda s=servo_id: self.send_single(s)).grid(row=row, column=3, padx=3, pady=3)
-
-    def log(self, message: str) -> None:
-        print(message)
-        try:
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", message + "\n")
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-        except tk.TclError:
-            pass
-
-    def _angle(self, servo_id: str) -> int:
-        return int(clamp(self.angle_vars[servo_id].get(), 0, 180))
-
-    def connect_serial(self) -> None:
-        self.serial_link.open(self.log)
-        self.update_serial_status()
-
-    def disconnect_serial(self) -> None:
-        self.serial_link.disconnect(self.log)
-        self.update_serial_status()
-
-    def update_serial_status(self) -> None:
-        if self.serial_link.is_connected():
-            self.serial_status.set(f"Serial: connected {SERIAL_PORT} @ {BAUDRATE}")
-        else:
-            self.serial_status.set("Serial: disconnected")
-
-    def enable_servos(self) -> None:
-        d11 = self._angle("D11")
-        d10 = self._angle("D10")
-        d9 = self._angle("D9")
-        d6 = self._angle("D6")
-        ok = messagebox.askyesno(
-            "Enable servos",
-            "This will attach servos and move them to the slider angles:\n"
-            f"D11={d11}, D10={d10}, D9={d9}, D6={d6}\n\nContinue?",
-        )
-        if not ok:
-            self.log("Enable servos cancelled.")
-            return
-        self.serial_link.send_command(f"ENABLE,{d11},{d10},{d9},{d6}", self.log)
-
-    def detach_servos(self) -> None:
-        self.serial_link.send_command("DETACH", self.log)
-
-    def send_single(self, servo_id: str) -> None:
-        angle = self._angle(servo_id)
-        self.serial_link.send_command(f"SET,{servo_id},{angle}", self.log)
-
-    def send_all(self) -> None:
-        d11 = self._angle("D11")
-        d10 = self._angle("D10")
-        d9 = self._angle("D9")
-        d6 = self._angle("D6")
-        self.serial_link.send_command(f"SETALL,{d11},{d10},{d9},{d6}", self.log)
-
-    def fill_d11_from_camera(self) -> None:
-        if self.latest_base_angle is None:
-            self.log("No camera base angle yet.")
-            return
-        angle = int(round(clamp(self.latest_base_angle, BASE_MIN, BASE_MAX)))
-        self.angle_vars["D11"].set(angle)
-        self.log(f"D11 slider set from camera: {angle}")
-
-    def grip_open(self) -> None:
-        self.angle_vars["D6"].set(GRIP_OPEN)
-        self.send_single("D6")
-
-    def grip_close(self) -> None:
-        self.angle_vars["D6"].set(GRIP_CLOSE)
-        self.send_single("D6")
-
-    def home_robot(self) -> None:
-        ok = messagebox.askyesno("Move HOME", "Move robot to HOME angles now?")
-        if not ok:
-            self.log("HOME cancelled.")
-            return
-        self.serial_link.send_command("HOME", self.log)
-
-    def confirm_pick(self) -> None:
-        if self.latest_detection is None or self.latest_base_angle is None:
-            self.log("No valid yellow square. PICK not sent.")
-            return
-
-        angle = int(round(clamp(self.latest_base_angle, BASE_MIN, BASE_MAX)))
-        detection = self.latest_detection
-        ok = messagebox.askyesno(
-            "Confirm PICK",
-            "Send PICK command to Arduino?\n\n"
-            f"X={detection.x_cm:.2f} cm, Y={detection.y_cm:.2f} cm\n"
-            f"Base angle D11={angle}",
-        )
-        if not ok:
-            self.log("PICK cancelled.")
-            return
-
-        self.serial_link.send_command(f"PICK,{angle}", self.log)
-
-    def update_live_status(
-        self,
-        camera_ok: bool,
-        calibrated: bool,
-        detection: Optional[Detection],
-        base_angle: Optional[float],
-    ) -> None:
-        self.latest_detection = detection
-        self.latest_base_angle = base_angle
-
-        if camera_ok:
-            self.camera_status.set("Camera: connected")
-        else:
-            self.camera_status.set("Camera: waiting / reconnecting")
-
-        if not calibrated:
-            self.detect_status.set("Object: waiting for 4-point calibration")
-            self.base_status.set("Base angle: --")
-        elif detection is None or base_angle is None:
-            self.detect_status.set("Object: none")
-            self.base_status.set("Base angle: --")
-        else:
-            self.detect_status.set(f"Object: X={detection.x_cm:.2f} cm, Y={detection.y_cm:.2f} cm")
-            self.base_status.set(f"Base angle: {base_angle:.0f} deg")
-
-        self.update_serial_status()
-
-    def poll(self) -> None:
-        try:
-            self.root.update_idletasks()
-            self.root.update()
-        except tk.TclError:
-            self.should_quit = True
-
-    def request_quit(self) -> None:
-        self.should_quit = True
-
-    def close(self) -> None:
-        try:
-            self.root.destroy()
-        except tk.TclError:
-            pass
+    def enable_servos(self) -> bool:
+        command = f"ENABLE,{HOME_D11},{HOME_D10},{HOME_D9},{GRIP_OPEN}"
+        ok = self.send_command(command)
+        if ok:
+            self.servos_enabled = True
+        return ok
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -501,7 +337,12 @@ def make_blank_mask(message: str) -> np.ndarray:
     return image
 
 
-def draw_calibration(frame: np.ndarray, calib: CalibrationState) -> np.ndarray:
+def put_lines(image: np.ndarray, lines: list[str], x: int, y: int, color: Tuple[int, int, int]) -> None:
+    for index, line in enumerate(lines):
+        cv2.putText(image, line, (x, y + index * 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
+
+
+def draw_calibration(frame: np.ndarray, calib: CalibrationState, camera_confirmed: bool, stable_count: int) -> np.ndarray:
     output = frame.copy()
 
     for index, point in enumerate(calib.points):
@@ -523,14 +364,34 @@ def draw_calibration(frame: np.ndarray, calib: CalibrationState) -> np.ndarray:
     if len(calib.points) == 4:
         cv2.line(output, calib.points[3], calib.points[0], (0, 255, 255), 2)
 
-    if not calib.is_ready():
+    if not camera_confirmed:
+        put_lines(
+            output,
+            [
+                f"Waiting stable camera: {min(stable_count, CAMERA_STABLE_FRAMES)}/{CAMERA_STABLE_FRAMES}",
+                "No robot command can be sent yet.",
+            ],
+            20,
+            35,
+            (0, 255, 255),
+        )
+    elif not calib.has_homography():
         next_index = len(calib.points)
         label = CALIBRATION_LABELS[next_index] if next_index < 4 else "done"
-        text = f"Click corner {next_index + 1}/4: {label}"
-        cv2.putText(output, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        put_lines(
+            output,
+            [
+                f"Click corner {next_index + 1}/4: {label}",
+                "Order: top-left, top-right, bottom-right, bottom-left",
+            ],
+            20,
+            35,
+            (0, 255, 255),
+        )
+    elif calib.needs_confirmation:
+        put_lines(output, ["Check Top View, then confirm calibration popup."], 20, 35, (0, 255, 255))
     else:
-        text = "Calibrated. Use GUI or p=confirm pick, r=reset, q=quit"
-        cv2.putText(output, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 0), 2)
+        put_lines(output, ["Ready. p=confirm PICK, r=reset calib, q=quit"], 20, 35, (0, 255, 0))
 
     return output
 
@@ -606,7 +467,12 @@ def compute_base_angle(x_cm: float) -> float:
     return clamp(BASE_CENTER + K_BASE * dx, BASE_MIN, BASE_MAX)
 
 
-def draw_detection(top_view: np.ndarray, detection: Optional[Detection], base_angle: Optional[float]) -> np.ndarray:
+def draw_detection(
+    top_view: np.ndarray,
+    detection: Optional[Detection],
+    base_angle: Optional[float],
+    system_enabled: bool,
+) -> np.ndarray:
     output = top_view.copy()
 
     center_px = (int(round(CENTER_X * PX_PER_CM)), int(round(CENTER_Y * PX_PER_CM)))
@@ -614,7 +480,7 @@ def draw_detection(top_view: np.ndarray, detection: Optional[Detection], base_an
     cv2.putText(output, "CENTER", (center_px[0] + 8, center_px[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2)
 
     if detection is None or base_angle is None:
-        cv2.putText(output, "No valid yellow square", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        put_lines(output, ["No valid yellow square", "No PICK can be sent."], 20, 35, (0, 0, 255))
         return output
 
     box = cv2.boxPoints(detection.rect)
@@ -627,25 +493,114 @@ def draw_detection(top_view: np.ndarray, detection: Optional[Detection], base_an
     cv2.circle(output, center, 5, (0, 0, 255), -1)
     cv2.line(output, center_px, center, (255, 255, 0), 2)
 
-    lines = [
-        f"X={detection.x_cm:.2f} cm  Y={detection.y_cm:.2f} cm",
-        f"dx={dx:.2f} cm  base={base_angle:.0f} deg",
-        f"size={detection.width_cm:.2f}x{detection.height_cm:.2f} cm  area={detection.area_cm2:.2f} cm2",
-        "Press p or GUI PICK, then confirm",
-    ]
-
-    y = 32
-    for line in lines:
-        cv2.putText(output, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-        y += 28
+    serial_state = "enabled" if system_enabled else "not enabled"
+    put_lines(
+        output,
+        [
+            f"X={detection.x_cm:.2f} cm  Y={detection.y_cm:.2f} cm",
+            f"dx={dx:.2f} cm  base={base_angle:.0f} deg",
+            f"size={detection.width_cm:.2f}x{detection.height_cm:.2f} cm  area={detection.area_cm2:.2f} cm2",
+            f"Robot: {serial_state}. Press p, then confirm.",
+        ],
+        20,
+        32,
+        (0, 255, 0),
+    )
 
     return output
 
 
+def confirm_camera_stable(dialog: ConfirmDialog) -> bool:
+    if not REQUIRE_CAMERA_STABLE_CONFIRM:
+        return True
+
+    return dialog.ask(
+        "Confirm camera",
+        "Camera frames are stable.\n\nContinue to 4-point calibration?",
+    )
+
+
+def confirm_calibration(dialog: ConfirmDialog) -> bool:
+    if not REQUIRE_CALIB_CONFIRM:
+        return True
+
+    return dialog.ask(
+        "Confirm calibration",
+        "Check the Top View window.\n\nUse this 4-point calibration?",
+    )
+
+
+def ensure_robot_enabled(serial_link: RobotSerial, dialog: ConfirmDialog) -> bool:
+    if not SEND_SERIAL:
+        return True
+
+    if not serial_link.is_connected():
+        if REQUIRE_SERIAL_CONFIRM:
+            ok = dialog.ask(
+                "Connect serial",
+                f"Connect Arduino serial now?\n\nPort: {SERIAL_PORT}\nBaudrate: {BAUDRATE}",
+            )
+            if not ok:
+                print("Serial connect cancelled.")
+                return False
+
+        if not serial_link.open():
+            return False
+
+    if not serial_link.servos_enabled:
+        if REQUIRE_ENABLE_CONFIRM:
+            ok = dialog.ask(
+                "Enable servos",
+                "Attach servos at these HOME/open angles?\n\n"
+                f"D11={HOME_D11}\nD10={HOME_D10}\nD9={HOME_D9}\nD6={GRIP_OPEN}\n\n"
+                "Robot may move to these angles only after you confirm.",
+            )
+            if not ok:
+                print("Servo enable cancelled.")
+                return False
+
+        if not serial_link.enable_servos():
+            return False
+
+    return True
+
+
+def confirm_and_send_pick(
+    detection: Optional[Detection],
+    base_angle: Optional[float],
+    serial_link: RobotSerial,
+    dialog: ConfirmDialog,
+) -> None:
+    if detection is None or base_angle is None:
+        print("No valid yellow square. PICK not sent.")
+        return
+
+    angle_int = int(round(clamp(base_angle, BASE_MIN, BASE_MAX)))
+
+    if REQUIRE_PICK_CONFIRM:
+        ok = dialog.ask(
+            "Confirm PICK",
+            "Send PICK command to robot?\n\n"
+            f"X={detection.x_cm:.2f} cm\n"
+            f"Y={detection.y_cm:.2f} cm\n"
+            f"D11 base_angle={angle_int}\n\n"
+            f"Command: PICK,{angle_int}",
+        )
+        if not ok:
+            print("PICK cancelled.")
+            return
+
+    if not ensure_robot_enabled(serial_link, dialog):
+        print("Robot is not enabled. PICK not sent.")
+        return
+
+    serial_link.send_command(f"PICK,{angle_int}")
+
+
 def main() -> None:
+    dialog = ConfirmDialog()
     calib = CalibrationState()
     serial_link = RobotSerial()
-    gui = ControlPanel(serial_link, calib.reset)
 
     cv2.namedWindow(WINDOW_CAMERA)
     cv2.namedWindow(WINDOW_TOP)
@@ -654,24 +609,29 @@ def main() -> None:
 
     cap = open_camera()
     if not cap.isOpened():
-        gui.log("Camera not connected yet. The program will keep reconnecting.")
+        print("Camera not connected yet. The program will keep reconnecting.")
 
+    camera_confirmed = False
+    stable_count = 0
+    last_frame_shape: Optional[Tuple[int, int, int]] = None
     last_reopen_time = 0.0
+
     latest_detection: Optional[Detection] = None
     latest_base_angle: Optional[float] = None
-    camera_ok = False
 
-    gui.log("Controls: click 4 corners | GUI buttons | p=confirm PICK | r=reset calib | q=quit")
-    gui.log("Corner order: top-left, top-right, bottom-right, bottom-left")
+    print("Controls: r=reset calibration | p=confirm PICK | q=quit")
+    print("Robot will not move until you confirm serial, enable servos, and confirm PICK.")
 
     try:
-        while not gui.should_quit:
-            serial_link.read_status(gui.log)
+        while True:
+            serial_link.read_status()
 
             ok, frame = cap.read() if cap.isOpened() else (False, None)
             camera_ok = ok and frame is not None
 
             if not camera_ok:
+                stable_count = 0
+                last_frame_shape = None
                 now = time.monotonic()
                 if now - last_reopen_time >= CAMERA_REOPEN_DELAY_SEC:
                     last_reopen_time = now
@@ -679,27 +639,51 @@ def main() -> None:
                     cap = open_camera()
 
                 camera_view = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(camera_view, "Camera not available", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                put_lines(camera_view, ["Camera not available", "Check DroidCam/IP camera URL."], 25, 45, (0, 0, 255))
                 top_view_display = make_blank_top_view("Waiting for camera")
                 mask_display = make_blank_mask("Waiting for camera")
                 latest_detection = None
                 latest_base_angle = None
             else:
-                camera_view = draw_calibration(frame, calib)
+                frame_shape = frame.shape
+                if last_frame_shape == frame_shape:
+                    stable_count += 1
+                else:
+                    stable_count = 1
+                    last_frame_shape = frame_shape
 
-                if calib.is_ready():
+                if camera_confirmed:
+                    calib.allow_clicks = True
+
+                camera_view = draw_calibration(frame, calib, camera_confirmed, stable_count)
+
+                if not camera_confirmed:
+                    top_view_display = make_blank_top_view("Confirm stable camera first")
+                    mask_display = make_blank_mask("Camera not confirmed")
+                    latest_detection = None
+                    latest_base_angle = None
+                elif calib.has_homography():
                     top_view = cv2.warpPerspective(frame, calib.homography, (TOP_WIDTH_PX, TOP_HEIGHT_PX))
-                    latest_detection, mask_display = detect_yellow_square(top_view)
-                    latest_base_angle = compute_base_angle(latest_detection.x_cm) if latest_detection is not None else None
-                    top_view_display = draw_detection(top_view, latest_detection, latest_base_angle)
+                    if calib.is_ready():
+                        latest_detection, mask_display = detect_yellow_square(top_view)
+                        latest_base_angle = compute_base_angle(latest_detection.x_cm) if latest_detection is not None else None
+                        top_view_display = draw_detection(
+                            top_view,
+                            latest_detection,
+                            latest_base_angle,
+                            serial_link.servos_enabled,
+                        )
+                    else:
+                        top_view_display = top_view.copy()
+                        put_lines(top_view_display, ["Check Top View, then confirm calibration."], 20, 35, (0, 255, 255))
+                        mask_display = make_blank_mask("Calibration not confirmed")
+                        latest_detection = None
+                        latest_base_angle = None
                 else:
                     top_view_display = make_blank_top_view("Click 4 corners on Camera window")
                     mask_display = make_blank_mask("No calibration")
                     latest_detection = None
                     latest_base_angle = None
-
-            gui.update_live_status(camera_ok, calib.is_ready(), latest_detection, latest_base_angle)
-            gui.poll()
 
             cv2.imshow(WINDOW_CAMERA, camera_view)
             cv2.imshow(WINDOW_TOP, top_view_display)
@@ -707,16 +691,41 @@ def main() -> None:
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
-                gui.request_quit()
-            elif key == ord("r"):
+                break
+            if key == ord("r"):
                 calib.reset()
-            elif key == ord("p"):
-                gui.confirm_pick()
+                latest_detection = None
+                latest_base_angle = None
+            if key == ord("p"):
+                if not camera_confirmed:
+                    print("Camera is not confirmed. PICK not sent.")
+                elif not calib.is_ready():
+                    print("Calibration is not confirmed. PICK not sent.")
+                else:
+                    confirm_and_send_pick(latest_detection, latest_base_angle, serial_link, dialog)
+
+            if camera_ok and not camera_confirmed and stable_count >= CAMERA_STABLE_FRAMES:
+                if confirm_camera_stable(dialog):
+                    camera_confirmed = True
+                    calib.allow_clicks = True
+                    print("Camera confirmed. Click 4 calibration corners.")
+                else:
+                    stable_count = 0
+                    print("Camera confirmation rejected. Waiting for stable camera again.")
+
+            if calib.needs_confirmation:
+                if confirm_calibration(dialog):
+                    calib.confirmed = True
+                    calib.needs_confirmation = False
+                    print("Calibration confirmed. Detection is enabled.")
+                else:
+                    calib.reset()
+                    print("Calibration rejected. Click 4 corners again.")
     finally:
         serial_link.close()
         cap.release()
         cv2.destroyAllWindows()
-        gui.close()
+        dialog.close()
 
 
 if __name__ == "__main__":
